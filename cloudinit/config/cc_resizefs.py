@@ -81,90 +81,98 @@ def handle(name, cfg, _cloud, log, args):
     else:
         resize_root = util.get_cfg_option_str(cfg, "resize_rootfs", True)
 
-    if not util.translate_bool(resize_root, addons=[NOBLOCK]):
-        log.debug("Skipping module named %s, resizing disabled", name)
-        return
-
     # TODO(harlowja) is the directory ok to be used??
     resize_root_d = util.get_cfg_option_str(cfg, "resize_rootfs_tmp", "/run")
     util.ensure_dir(resize_root_d)
 
+    # allow configuration of resize points
+    resize_fs = util.get_cfg_option_list(cfg, "resize_fs", [])
+
+    if not util.translate_bool(resize_root, addons=[NOBLOCK]) and not resize_fs:
+        log.debug("Skipping module named %s, resizing disabled", name)
+        return
+
+    # resize rootfs if enabled
+    if util.translate_bool(resize_root, addons=[NOBLOCK]) and '/' not in resize_fs:
+        resize_fs.insert(0, '/')
+
     # TODO(harlowja): allow what is to be resized to be configurable??
-    resize_what = "/"
-    result = util.get_mount_info(resize_what, log)
-    if not result:
-        log.warn("Could not determine filesystem type of %s", resize_what)
-        return
+    for resize_what in resize_fs:
+        result = util.get_mount_info(resize_what, log)
+        if not result:
+            log.warn("Could not determine filesystem type of %s", resize_what)
+            continue
 
-    (devpth, fs_type, mount_point) = result
+        (devpth, fs_type, mount_point) = result
 
-    # Ensure the path is a block device.
-    info = "dev=%s mnt_point=%s path=%s" % (devpth, mount_point, resize_what)
-    log.debug("resize_info: %s" % info)
+        # Ensure the path is a block device.
+        info = "dev=%s mnt_point=%s path=%s" % (
+            devpth, mount_point, resize_what)
+        log.debug("resize_info: %s" % info)
 
-    container = util.is_container()
+        container = util.is_container()
 
-    if (devpth == "/dev/root" and not os.path.exists(devpth) and
-        not container):
-        devpth = rootdev_from_cmdline(util.get_cmdline())
-        if devpth is None:
-            log.warn("Unable to find device '/dev/root'")
-            return
-        log.debug("Converted /dev/root to '%s' per kernel cmdline", devpth)
+        if (devpth == "/dev/root" and not os.path.exists(devpth) and
+                not container):
+            devpth = rootdev_from_cmdline(util.get_cmdline())
+            if devpth is None:
+                log.warn("Unable to find device '/dev/root'")
+                continue
+            log.debug("Converted /dev/root to '%s' per kernel cmdline", devpth)
 
-    try:
-        statret = os.stat(devpth)
-    except OSError as exc:
-        if container and exc.errno == errno.ENOENT:
-            log.debug("Device '%s' did not exist in container. "
-                      "cannot resize: %s" % (devpth, info))
-        elif exc.errno == errno.ENOENT:
-            log.warn("Device '%s' did not exist. cannot resize: %s" %
-                     (devpth, info))
+        try:
+            statret = os.stat(devpth)
+        except OSError as exc:
+            if container and exc.errno == errno.ENOENT:
+                log.debug("Device '%s' did not exist in container. "
+                          "cannot resize: %s" % (devpth, info))
+            elif exc.errno == errno.ENOENT:
+                log.warn("Device '%s' did not exist. cannot resize: %s" %
+                         (devpth, info))
+            else:
+                raise exc
+            continue
+
+        if not stat.S_ISBLK(statret.st_mode) and not stat.S_ISCHR(statret.st_mode):
+            if container:
+                log.debug("device '%s' not a block device in container."
+                          " cannot resize: %s" % (devpth, info))
+            else:
+                log.warn("device '%s' not a block device. cannot resize: %s" %
+                         (devpth, info))
+            continue
+
+        resizer = None
+        fstype_lc = fs_type.lower()
+        for (pfix, root_cmd) in RESIZE_FS_PREFIXES_CMDS:
+            if fstype_lc.startswith(pfix):
+                resizer = root_cmd
+                break
+
+        if not resizer:
+            log.warn("Not resizing unknown filesystem type %s for %s",
+                     fs_type, resize_what)
+            continue
+
+        resize_cmd = resizer(resize_what, devpth)
+        log.debug("Resizing %s (%s) using %s", resize_what, fs_type,
+                  ' '.join(resize_cmd))
+
+        if resize_root == NOBLOCK:
+            # Fork to a child that will run
+            # the resize command
+            util.fork_cb(
+                util.log_time(logfunc=log.debug, msg="backgrounded Resizing",
+                              func=do_resize, args=(resize_cmd, log)))
         else:
-            raise exc
-        return
+            util.log_time(logfunc=log.debug, msg="Resizing",
+                          func=do_resize, args=(resize_cmd, log))
 
-    if not stat.S_ISBLK(statret.st_mode) and not stat.S_ISCHR(statret.st_mode):
-        if container:
-            log.debug("device '%s' not a block device in container."
-                      " cannot resize: %s" % (devpth, info))
-        else:
-            log.warn("device '%s' not a block device. cannot resize: %s" %
-                     (devpth, info))
-        return
-
-    resizer = None
-    fstype_lc = fs_type.lower()
-    for (pfix, root_cmd) in RESIZE_FS_PREFIXES_CMDS:
-        if fstype_lc.startswith(pfix):
-            resizer = root_cmd
-            break
-
-    if not resizer:
-        log.warn("Not resizing unknown filesystem type %s for %s",
-                 fs_type, resize_what)
-        return
-
-    resize_cmd = resizer(resize_what, devpth)
-    log.debug("Resizing %s (%s) using %s", resize_what, fs_type,
-              ' '.join(resize_cmd))
-
-    if resize_root == NOBLOCK:
-        # Fork to a child that will run
-        # the resize command
-        util.fork_cb(
-            util.log_time(logfunc=log.debug, msg="backgrounded Resizing",
-                func=do_resize, args=(resize_cmd, log)))
-    else:
-        util.log_time(logfunc=log.debug, msg="Resizing",
-            func=do_resize, args=(resize_cmd, log))
-
-    action = 'Resized'
-    if resize_root == NOBLOCK:
-        action = 'Resizing (via forking)'
-    log.debug("%s root filesystem (type=%s, val=%s)", action, fs_type,
-              resize_root)
+        action = 'Resized'
+        if resize_root == NOBLOCK:
+            action = 'Resizing (via forking)'
+        log.debug("%s root filesystem (type=%s, val=%s)", action, fs_type,
+                  resize_root)
 
 
 def do_resize(resize_cmd, log):
